@@ -32,7 +32,7 @@ func StructToStruct(filter FieldFilter, src, dst interface{}, userOpts ...Option
 	if dstVal.Kind() != reflect.Struct {
 		return errors.Errorf("dst kind must be a struct, %s given", dstVal.Kind())
 	}
-	return structToStruct(filter, &srcVal, &dstVal, opts)
+	return structToStruct(filter, &srcVal, &dstVal, opts, nil)
 }
 
 func ensureCompatible(src, dst *reflect.Value) error {
@@ -50,7 +50,7 @@ func ensureCompatible(src, dst *reflect.Value) error {
 	return nil
 }
 
-func structToStruct(filter FieldFilter, src, dst *reflect.Value, userOptions *options) error {
+func structToStruct(filter FieldFilter, src, dst *reflect.Value, userOptions *options, parentName *string) error {
 	if err := ensureCompatible(src, dst); err != nil {
 		return err
 	}
@@ -90,8 +90,11 @@ func structToStruct(filter FieldFilter, src, dst *reflect.Value, userOptions *op
 			if !dstField.CanSet() {
 				return errors.Errorf("Can't set a value on a destination field %s", dstName)
 			}
-
-			if err := structToStruct(subFilter, &srcField, &dstField, userOptions); err != nil {
+			nextParentName := srcName
+			if parentName != nil {
+				nextParentName = *parentName + "." + nextParentName
+			}
+			if err := structToStruct(subFilter, &srcField, &dstField, userOptions, &nextParentName); err != nil {
 				return err
 			}
 		}
@@ -128,7 +131,7 @@ func structToStruct(filter FieldFilter, src, dst *reflect.Value, userOptions *op
 			}
 			dstProtoValue := reflect.ValueOf(dstProto)
 
-			if err := structToStruct(filter, &srcProtoValue, &dstProtoValue, userOptions); err != nil {
+			if err := structToStruct(filter, &srcProtoValue, &dstProtoValue, userOptions, nil); err != nil {
 				return err
 			}
 
@@ -146,7 +149,7 @@ func structToStruct(filter FieldFilter, src, dst *reflect.Value, userOptions *op
 			dstElem = dst.Elem()
 		}
 
-		if err := structToStruct(filter, &srcElem, &dstElem, userOptions); err != nil {
+		if err := structToStruct(filter, &srcElem, &dstElem, userOptions, nil); err != nil {
 			return err
 		}
 
@@ -165,7 +168,7 @@ func structToStruct(filter FieldFilter, src, dst *reflect.Value, userOptions *op
 		}
 
 		srcElem, dstElem := src.Elem(), dst.Elem()
-		if err := structToStruct(filter, &srcElem, &dstElem, userOptions); err != nil {
+		if err := structToStruct(filter, &srcElem, &dstElem, userOptions, nil); err != nil {
 			return err
 		}
 
@@ -176,32 +179,33 @@ func structToStruct(filter FieldFilter, src, dst *reflect.Value, userOptions *op
 			break
 		}
 
-		dstLen := dst.Len()
-		srcLen := userOptions.CopyListSize(src)
-
-		for i := 0; i < srcLen; i++ {
-			srcItem := src.Index(i)
-			var dstItem reflect.Value
-			if i < dstLen {
-				// Use an existing item.
-				dstItem = dst.Index(i)
-			} else {
-				// Create a new item if needed.
-				dstItem = reflect.New(dst.Type().Elem()).Elem()
-			}
-
-			if err := structToStruct(filter, &srcItem, &dstItem, userOptions); err != nil {
-				return err
-			}
-
-			if i >= dstLen {
-				// Append newly created items to the slice.
-				dst.Set(reflect.Append(*dst, dstItem))
+		// correct this
+		handlerField := *parentName
+		listHandler, found := userOptions.ListHandlers[handlerField]
+		if !found || listHandler.OverrideFullList {
+			dst.Set(*src)
+			break
+		}
+		srcIndex := 0
+		if listHandler.ListKeyVariableName != nil {
+			filterKey := filter.GetCurrentFilterKey()
+			dstIndex := findIndex(dst, listHandler.ListKeyVariableName, filterKey)
+			srcIndex = findIndex(src, listHandler.ListKeyVariableName, filterKey)
+			if dstIndex != -1 {
+				dstItem := dst.Index(dstIndex)
+				srcItem := reflect.Zero(dstItem.Type())
+				if srcIndex != -1 {
+					srcItem = src.Index(srcIndex)
+				}
+				subFilter, _ := filter.Filter(filterKey)
+				if err := structToStruct(subFilter, &srcItem, &dstItem, userOptions, parentName); err != nil {
+					return err
+				}
+				break
 			}
 		}
-		if dstLen > srcLen {
-			dst.SetLen(srcLen)
-		}
+
+		dst.Set(reflect.Append(*dst, src.Index(srcIndex)))
 
 	case reflect.Array:
 		dstLen := dst.Len()
@@ -212,7 +216,7 @@ func structToStruct(filter FieldFilter, src, dst *reflect.Value, userOptions *op
 		for i := 0; i < srcLen; i++ {
 			srcItem := src.Index(i)
 			dstItem := dst.Index(i)
-			if err := structToStruct(filter, &srcItem, &dstItem, userOptions); err != nil {
+			if err := structToStruct(filter, &srcItem, &dstItem, userOptions, nil); err != nil {
 				return errors.WithStack(err)
 			}
 		}
@@ -234,6 +238,16 @@ func structToStruct(filter FieldFilter, src, dst *reflect.Value, userOptions *op
 	return nil
 }
 
+func findIndex(dst *reflect.Value, keyVariableName *string, key string) int {
+	for i := 0; i < dst.Len(); i++ {
+		keyField := dst.Index(i).FieldByName(*keyVariableName)
+		if keyField.Equal(reflect.ValueOf(key)) {
+			return i
+		}
+	}
+	return -1
+}
+
 // options are used in StructToStruct and StructToMap functions to modify the copying behavior.
 type options struct {
 	// DstTag can be used to customize the dst field name according to the field's tag, i.g. json.
@@ -250,6 +264,14 @@ type options struct {
 	// It is called before copying the data from source to destination allowing custom processing.
 	// If the visitor function returns true the visited field is skipped.
 	MapVisitor mapVisitor
+
+	// ListHandlers ...
+	ListHandlers map[string]ListHandler
+}
+
+type ListHandler struct {
+	OverrideFullList    bool
+	ListKeyVariableName *string
 }
 
 // mapVisitor is called for every filtered field in structToMap.
@@ -264,6 +286,13 @@ type MapVisitorResult struct {
 
 // Option function modifies the given options.
 type Option func(*options)
+
+// WithListHandlers ...
+func WithListHandlers(handlers map[string]ListHandler) Option {
+	return func(o *options) {
+		o.ListHandlers = handlers
+	}
+}
 
 // WithTag sets the destination field name
 func WithTag(s string) Option {
@@ -334,7 +363,7 @@ func structToMap(filter FieldFilter, src, dst reflect.Value, userOptions *option
 		}
 		srcType := src.Type()
 		for i := 0; i < src.NumField(); i++ {
-			srcName  := fieldName(userOptions.SrcTag, srcType.Field(i))
+			srcName := fieldName(userOptions.SrcTag, srcType.Field(i))
 			if !isExported(srcType.Field(i)) {
 				// Unexported fields can not be copied.
 				continue

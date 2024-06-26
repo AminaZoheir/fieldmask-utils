@@ -15,6 +15,7 @@ type FieldFilter interface {
 	Filter(fieldName string) (FieldFilter, bool)
 	// Returns true if the FieldFilter is empty. In this case all fields are copied.
 	IsEmpty() bool
+	GetCurrentFilterKey() string
 }
 
 // FieldFilterContainer is a FieldFilter with additional methods Get and Set.
@@ -42,6 +43,14 @@ func (m Mask) Set(fieldName string, filter FieldFilterContainer) {
 
 // Compile time interface check.
 var _ FieldFilter = Mask{}
+
+// GetCurrentFilterKey ...
+func (m Mask) GetCurrentFilterKey() string {
+	for field := range m {
+		return field
+	}
+	return ""
+}
 
 // Filter returns true for those fieldNames that exist in the underlying map.
 // Field names that start with "XXX_" are ignored as unexported.
@@ -112,6 +121,14 @@ func (m MaskInverse) Filter(fieldName string) (FieldFilter, bool) {
 		return nil, false
 	}
 	return subFilter, !subFilter.IsEmpty()
+}
+
+// GetCurrentFilterKey ...
+func (m MaskInverse) GetCurrentFilterKey() string {
+	for field := range m {
+		return field
+	}
+	return ""
 }
 
 // IsEmpty returns true if the mask is empty.
